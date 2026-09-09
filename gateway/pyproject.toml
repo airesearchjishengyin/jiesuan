@@ -1,0 +1,16 @@
+[project]
+name = "jiesuan-gateway"
+version = "0.1.0"
+description = "借算 网关 — OpenAI 兼容的多节点推理路由器"
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9", "yarl>=1.9"]
+
+[project.scripts]
+jiesuan-gateway = "jiesuan_gateway.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jiesuan_gateway*"]

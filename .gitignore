@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# 运行时数据
+*.jsonl
+*.log
+data/
+*.sqlite3
+
+# IDE/系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 环境变量与密钥(绝不入库)
+.env
+*.key
+config.local.*
+trace.jsonl
