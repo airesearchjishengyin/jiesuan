@@ -132,6 +132,7 @@ class GatewayState:
     static_nodes: list[dict] = field(default_factory=list)  # 无agent哑节点: [{"name","url","models":[...]}]
     tiers: "TierConfig | None" = None
     capacity: "CapacityManager | None" = None
+    manually_offline: set = field(default_factory=set)  # 手动摘流的节点名 (admin 控制)
 
     def bootstrap_static(self) -> None:
         """把 --static-node 配置注册进节点表 (哑节点: 引擎直连, 无心跳, 常驻)。"""
@@ -209,6 +210,8 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     model = body.get("model", "")
 
     nodes = st.nodes.alive(model=model)
+    # 手动摘流的节点不参与调度
+    nodes = [n for n in nodes if n.name not in st.manually_offline]
     node = st.scheduler.pick(nodes, model, {"rid": rid})
     t0 = time.time()
 
@@ -269,11 +272,18 @@ async def make_app(st: GatewayState) -> web.Application:
     app["state"] = st
     app.router.add_post("/node/register", node_register)
     app.router.add_post("/node/heartbeat", node_heartbeat)
+    async def list_models(request: web.Request) -> web.Response:
+        return web.json_response(
+            {"models": sorted({m for n in st.nodes.alive()
+                               if n.name not in st.manually_offline
+                               for m in n.models})})
+
     app.router.add_get("/nodes", list_nodes)
     app.router.add_post("/v1/chat/completions", chat_completions)
-    app.router.add_get("/v1/models",
-                       lambda r: web.json_response(
-                           {"models": sorted({m for n in st.nodes.alive() for m in n.models})}))
+    app.router.add_get("/v1/models", list_models)
+
+    from jiesuan_gateway.admin import register_admin
+    register_admin(app, st)
     return app
 
 
