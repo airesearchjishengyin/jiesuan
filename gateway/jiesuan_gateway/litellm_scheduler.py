@@ -3,12 +3,8 @@
 定位: 生产执行后端 — 把节点池映射成 LiteLLM Router 的部署列表,
 获得 延迟感知路由 / 失败冷却 / 自动 failover / 重试。研究层 L0/L1/L2 不受影响。
 
-为什么选 LiteLLM (对比 PAIR/llm-d/mycoSwarm, 2026-09):
-  - 唯一可库级嵌入的框架(纯 Python), 不需要独立路由进程
-  - 自带 latency-based routing (补 PAIR 自认的"不看容量/延迟"缺陷)
-  - cooldown + failover + retry = 借算 v0.1 尚未实现的容错面
-  - 原生支持 Ollama 的 OpenAI 兼容端点 (异构 Mac/NVIDIA 直接可用)
-  - llm-d 更强但 K8s-only; mycoSwarm 太早期; PAIR 不可嵌入且策略更弱
+Qwen3.5 thinking-model handling: content 为空时回填 reasoning_content (ADR-003 附录),
+并对 qwen3.5* 自动注入 /no_think (日常问答不需要 3-5万 token 的 reasoning)。
 """
 from __future__ import annotations
 
@@ -16,6 +12,12 @@ import time
 from dataclasses import dataclass
 
 from jiesuan_gateway.__main__ import NodeEntry, NodeTable, Scheduler
+
+THINKING_PREFIX = "/no_think"  # qwen3.5 系列: 系统提示注入, 避免推理模式烧 token
+
+
+def _is_thinking_model(model: str) -> bool:
+    return model.startswith("qwen3.5")
 
 
 @dataclass
@@ -99,7 +101,24 @@ class LiteLLMScheduler(Scheduler):
         model = body.get("model", "")
         if self._router is None:
             raise RuntimeError("no deployments available")
-        # 去掉 LiteLLM 不认识的字段
-        fwd = {k: v for k, v in body.items() if k not in ("stream",)}
+        fwd = {k: v for k, v in body.items() if k != "stream"}
+        # qwen3.5 thinking 模型: 默认 /no_think (用户消息级软开关, 已验证)
+        if _is_thinking_model(model):
+            msgs = fwd.get("messages") or []
+            if msgs and not any(
+                isinstance(m.get("content"), str) and "/no_think" in m.get("content", "")
+                for m in msgs):
+                injected = dict(msgs[0])
+                injected["content"] = f"{THINKING_PREFIX} {injected.get('content', '')}"
+                fwd["messages"] = [injected] + msgs[1:]
         resp = await self._router.acompletion(**fwd, num_retries=2)
+        # thinking 模型 content 为空时回填 reasoning (调用方拿到的永远是可用文本)
+        try:
+            msg = resp.choices[0].message
+            if not (msg.content or "").strip():
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                if reasoning:
+                    msg.content = reasoning
+        except (AttributeError, IndexError):
+            pass
         return resp
