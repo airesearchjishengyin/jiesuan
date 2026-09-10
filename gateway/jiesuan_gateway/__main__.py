@@ -278,6 +278,15 @@ async def make_app(st: GatewayState) -> web.Application:
 
 
 async def amain(args: argparse.Namespace) -> None:
+    # 端口预检: 给出可操作的错误而不是 traceback (DEPLOYMENT.md §7)
+    probe = await aiohttp.ClientSession().get(
+        f"http://127.0.0.1:{args.port}/nodes", timeout=aiohttp.ClientTimeout(total=2))
+    if probe.status == 200:
+        existing = await probe.json()
+        print(f"[gw] port {args.port} already served by another gateway "
+              f"({existing.get('scheduler')}) — nothing to do. "
+              f"Kill it first: see docs/DEPLOYMENT.md §7", flush=True)
+        return
     sched = _get_scheduler(args.scheduler)
     st = GatewayState(scheduler=sched, trace_path=args.trace)
     # 静态哑节点: --static-node name=win,url=http://ip:11434,models=qwen3:4b (可重复)
