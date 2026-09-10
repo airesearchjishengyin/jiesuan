@@ -215,7 +215,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     # ---- L-Prod (LiteLLM) 路径: 路由/failover/重试全权交给 Router ----
     if node is None and st.scheduler.name.startswith("L-Prod"):
         try:
-            resp = await st.scheduler.acompletion(st.nodes, body)  # type: ignore[union-attr]
+            resp = await st.scheduler.acompletion(st.nodes, body, st.capacity, st.tiers)  # type: ignore[union-attr]
             _trace(st, rid=rid, event="done", node="litellm-router",
                    elapsed=round(time.time() - t0, 3), status=200)
             payload = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)

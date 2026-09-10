@@ -35,7 +35,7 @@ class LiteLLMScheduler(Scheduler):
 
     # ---- 内部: 从节点表构建 LiteLLM deployments ----------------------------
 
-    def _refresh(self, nodes_table: NodeTable) -> None:
+    def _refresh(self, nodes_table: NodeTable, capacity=None, tiers=None) -> None:
         from litellm import Router
 
         now = time.time()
@@ -46,8 +46,7 @@ class LiteLLMScheduler(Scheduler):
         by_model: dict[str, list[dict]] = {}
         for n in nodes_table.alive():
             # engine_base_url: agent节点=代理端点 / engine哑节点=引擎直连
-            base = (n.proxy_url if n.kind == "engine"
-                    else n.proxy_url)  # v0.2: agent节点也可走 /v1 代理
+            base = n.proxy_url
             for m in n.models:
                 dep_name = f"jiesuan-{n.name}"
                 by_model.setdefault(m, []).append({
@@ -63,6 +62,13 @@ class LiteLLMScheduler(Scheduler):
         new_map = {k: [d["model_info"]["id"] for d in v] for k, v in by_model.items()}
         if new_map != self._deployments or self._router is None:
             all_deps = [d for deps in by_model.values() for d in deps]
+            # ADR-003: tier 降级链 — high 饱和/不存在时 fallback 到 mid/low
+            # (deployment 不存在时 litellm 自动跳过该 fallback, 降级语义按需生效)
+            fallbacks: list[dict] = []
+            if tiers and tiers.high:
+                chain = [m for m in tiers.chain() if m != tiers.high]
+                if chain:
+                    fallbacks = [{tiers.high: chain}]
             self._router = Router(
                 model_list=all_deps,
                 routing_strategy="latency-based-routing",
@@ -70,10 +76,12 @@ class LiteLLMScheduler(Scheduler):
                 retry_after=2,
                 cooldown_time=20,          # 失败节点冷却 20s
                 allowed_fails=2,
-                fallbacks=[],              # 跨模型 fallback 交给上层
+                fallbacks=fallbacks,
                 set_verbose=False,
             )
             self._deployments = new_map
+            if fallbacks:
+                print(f"[lprod] fallback chain: {fallbacks}", flush=True)
 
     # ---- Scheduler 接口 ---------------------------------------------------
 
@@ -85,9 +93,9 @@ class LiteLLMScheduler(Scheduler):
         """
         return None
 
-    async def acompletion(self, nodes_table: NodeTable, body: dict):
+    async def acompletion(self, nodes_table: NodeTable, body: dict, capacity=None, tiers=None):
         """真正入口: 用 LiteLLM Router 执行请求 (非流式)。"""
-        self._refresh(nodes_table)
+        self._refresh(nodes_table, capacity, tiers)
         model = body.get("model", "")
         if self._router is None:
             raise RuntimeError("no deployments available")
