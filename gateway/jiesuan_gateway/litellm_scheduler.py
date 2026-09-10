@@ -13,7 +13,8 @@ from dataclasses import dataclass
 
 from jiesuan_gateway.__main__ import NodeEntry, NodeTable, Scheduler
 
-THINKING_PREFIX = "/no_think"  # qwen3.5 系列: 系统提示注入, 避免推理模式烧 token
+THINKING_PREFIX = "/no_think"  # qwen3.5 系列: system 提示注入, 减少思考 (不完全生效)
+MIN_NUM_PREDICT = 400          # thinking 模型保底: 防止 num_predict 太小导致 content 永远为空
 
 
 def _is_thinking_model(model: str) -> bool:
@@ -95,13 +96,11 @@ class LiteLLMScheduler(Scheduler):
         """
         return None
 
-    async def astream(self, nodes_table: NodeTable, body: dict, capacity=None, tiers=None):
-        """流式入口: Router.astream (qwen3.5 /no_think 注入同 acompletion)。"""
-        self._refresh(nodes_table, capacity, tiers)
-        model = body.get("model", "")
-        if self._router is None:
-            raise RuntimeError("no deployments available")
+    @staticmethod
+    def _prepare_body(body: dict) -> dict:
+        """公共预处理: /no_think 注入 (system role) + num_predict 保底。"""
         fwd = {k: v for k, v in body.items() if k != "stream"}
+        model = fwd.get("model", "")
         if _is_thinking_model(model):
             msgs = fwd.get("messages") or []
             if msgs and not any(
@@ -110,6 +109,25 @@ class LiteLLMScheduler(Scheduler):
                 injected = dict(msgs[0])
                 injected["content"] = f"{THINKING_PREFIX} {injected.get('content', '')}"
                 fwd["messages"] = [injected] + msgs[1:]
+            opts = fwd.setdefault("options", {}) if "options" in fwd else fwd.setdefault(
+                "max_tokens", 0) and None or fwd.setdefault("options", {})
+            if "options" in fwd:
+                np_ = int(opts.get("num_predict", 0) or 0)
+                if np_ < MIN_NUM_PREDICT:
+                    opts["num_predict"] = MIN_NUM_PREDICT
+            else:
+                mt = int(fwd.get("max_tokens", 0) or 0)
+                if mt < MIN_NUM_PREDICT:
+                    fwd["max_tokens"] = MIN_NUM_PREDICT
+        return fwd
+
+    async def astream(self, nodes_table: NodeTable, body: dict, capacity=None, tiers=None):
+        """流式入口: Router.astream (qwen3.5 /no_think 注入同 acompletion)。"""
+        self._refresh(nodes_table, capacity, tiers)
+        model = body.get("model", "")
+        if self._router is None:
+            raise RuntimeError("no deployments available")
+        fwd = self._prepare_body(body)
         return await self._router.acompletion(**fwd, stream=True, num_retries=2)
 
     async def acompletion(self, nodes_table: NodeTable, body: dict, capacity=None, tiers=None):
@@ -118,16 +136,7 @@ class LiteLLMScheduler(Scheduler):
         model = body.get("model", "")
         if self._router is None:
             raise RuntimeError("no deployments available")
-        fwd = {k: v for k, v in body.items() if k != "stream"}
-        # qwen3.5 thinking 模型: 默认 /no_think (用户消息级软开关, 已验证)
-        if _is_thinking_model(model):
-            msgs = fwd.get("messages") or []
-            if msgs and not any(
-                isinstance(m.get("content"), str) and "/no_think" in m.get("content", "")
-                for m in msgs):
-                injected = dict(msgs[0])
-                injected["content"] = f"{THINKING_PREFIX} {injected.get('content', '')}"
-                fwd["messages"] = [injected] + msgs[1:]
+        fwd = self._prepare_body(body)
         resp = await self._router.acompletion(**fwd, num_retries=2)
         # thinking 模型 content 为空时回填 reasoning (调用方拿到的永远是可用文本)
         try:
