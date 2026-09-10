@@ -36,6 +36,13 @@ class NodeEntry:
     pending: int = 0
     last_seen: float = field(default_factory=time.time)
     proxy_url: str = ""          # http://ip:port (节点代理端点)
+    kind: str = "agent"          # agent=有jiesuan-node代理 / engine=哑节点直连Ollama
+
+    def chat_url(self) -> str:
+        """回源地址: agent节点走 /v1/chat/completions 代理; 哑节点直连 Ollama /api/chat。"""
+        if self.kind == "engine":
+            return f"{self.proxy_url}/api/chat"
+        return f"{self.proxy_url}/v1/chat/completions"
 
 
 class NodeTable:
@@ -113,6 +120,18 @@ class GatewayState:
     scheduler: Scheduler = field(default_factory=RoundRobin)
     trace_path: str = "trace.jsonl"
     req_counter: int = 0
+    static_nodes: list[dict] = field(default_factory=list)  # 无agent哑节点: [{"name","url","models":[...]}]
+
+    def bootstrap_static(self) -> None:
+        """把 --static-node 配置注册进节点表 (哑节点: 引擎直连, 无心跳, 常驻)。"""
+        for s in self.static_nodes:
+            entry = NodeEntry(name=s["name"], proxy_url=s["url"].rstrip("/"),
+                              models=s.get("models", []), os=s.get("os", "engine"),
+                              kind="engine",
+                              last_seen=time.time() + 1e9)  # 永不过期
+            self.nodes.upsert(entry)
+            print(f"[gw] +static-node {entry.name} → {entry.proxy_url} models={entry.models}",
+                  flush=True)
 
 
 def _trace(st: GatewayState, **kv) -> None:
@@ -184,7 +203,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     try:
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(yarl.URL(f"{node.proxy_url}/v1/chat/completions"),
+            async with s.post(yarl.URL(node.chat_url()),
                               data=json.dumps(body).encode(),
                               headers={"Content-Type": "application/json"}) as up:
                 resp = web.StreamResponse(status=up.status,
@@ -228,6 +247,12 @@ async def make_app(st: GatewayState) -> web.Application:
 async def amain(args: argparse.Namespace) -> None:
     sched = SCHEDULERS.get(args.scheduler, RoundRobin)()
     st = GatewayState(scheduler=sched, trace_path=args.trace)
+    # 静态哑节点: --static-node name=win,url=http://ip:11434,models=qwen3:4b (可重复)
+    for spec in args.static_node or []:
+        parts = dict(kv.split("=", 1) for kv in spec.split(",") if "=" in kv)
+        parts["models"] = [m for m in parts.get("models", "").split(";") if m]
+        st.static_nodes.append(parts)
+    st.bootstrap_static()
     app = await make_app(st)
     sw = asyncio.create_task(sweep_dead_nodes(st))
     runner = web.AppRunner(app)
@@ -248,6 +273,8 @@ def main() -> None:
     ap.add_argument("--scheduler", choices=list(SCHEDULERS), default="L1",
                     help="L0=roundrobin L1=leastpending")
     ap.add_argument("--trace", default="trace.jsonl")
+    ap.add_argument("--static-node", action="append",
+                    help="哑节点: name=X,url=http://ip:11434,models=m1;m2 (无agent, 引擎直连)")
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))
