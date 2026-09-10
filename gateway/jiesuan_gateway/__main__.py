@@ -22,6 +22,8 @@ import aiohttp
 import yarl
 from aiohttp import web
 
+from jiesuan_gateway.capacity import CapacityManager, TierConfig
+
 HEARTBEAT_TIMEOUT = 20.0  # 秒; 超时未心跳 = 节点下线
 
 
@@ -128,6 +130,8 @@ class GatewayState:
     trace_path: str = "trace.jsonl"
     req_counter: int = 0
     static_nodes: list[dict] = field(default_factory=list)  # 无agent哑节点: [{"name","url","models":[...]}]
+    tiers: "TierConfig | None" = None
+    capacity: "CapacityManager | None" = None
 
     def bootstrap_static(self) -> None:
         """把 --static-node 配置注册进节点表 (哑节点: 引擎直连, 无心跳, 常驻)。"""
@@ -176,7 +180,15 @@ async def node_heartbeat(request: web.Request) -> web.Response:
     e.last_seen = time.time()
     e.pending = d.get("pending", e.pending)
     e.models = d.get("models", e.models)
-    return web.json_response({"ok": True})
+
+    # CapacityManager: 容量/idle 状态机 (返回要下发的指令)
+    commands: list[dict] = []
+    if st.capacity is not None:
+        d2 = dict(d)
+        d2["engine_url"] = e.proxy_url
+        cap_res = st.capacity.on_heartbeat(d2)
+        commands = cap_res.get("commands", [])
+    return web.json_response({"ok": True, "commands": commands})
 
 
 async def list_nodes(request: web.Request) -> web.Response:
@@ -274,6 +286,18 @@ async def amain(args: argparse.Namespace) -> None:
         parts["models"] = [m for m in parts.get("models", "").split(";") if m]
         st.static_nodes.append(parts)
     st.bootstrap_static()
+
+    # ADR-003 tier 配置 → CapacityManager
+    if args.tier:
+        kv = {}
+        for spec in args.tier:
+            k, _, v = spec.partition("=")
+            kv[k.lower()] = v
+        st.tiers = TierConfig(high=kv.get("high", ""), mid=kv.get("mid", ""), low=kv.get("low", ""))
+        st.capacity = CapacityManager(tiers=st.tiers, gateway_port=args.port)
+        print(f"[gw] capacity manager ON: tiers high={st.tiers.high} mid={st.tiers.mid} "
+              f"low={st.tiers.low}", flush=True)
+
     app = await make_app(st)
     sw = asyncio.create_task(sweep_dead_nodes(st))
     runner = web.AppRunner(app)
@@ -296,6 +320,8 @@ def main() -> None:
     ap.add_argument("--trace", default="trace.jsonl")
     ap.add_argument("--static-node", action="append",
                     help="哑节点: name=X,url=http://ip:11434,models=m1;m2 (无agent, 引擎直连)")
+    ap.add_argument("--tier", action="append", metavar="HIGH=qwen3:14b",
+                    help="档位声明: high/mid/low=模型名 (启用 ADR-003 容量调度)")
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))
