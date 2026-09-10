@@ -95,6 +95,23 @@ class LiteLLMScheduler(Scheduler):
         """
         return None
 
+    async def astream(self, nodes_table: NodeTable, body: dict, capacity=None, tiers=None):
+        """流式入口: Router.astream (qwen3.5 /no_think 注入同 acompletion)。"""
+        self._refresh(nodes_table, capacity, tiers)
+        model = body.get("model", "")
+        if self._router is None:
+            raise RuntimeError("no deployments available")
+        fwd = {k: v for k, v in body.items() if k != "stream"}
+        if _is_thinking_model(model):
+            msgs = fwd.get("messages") or []
+            if msgs and not any(
+                isinstance(m.get("content"), str) and "/no_think" in m.get("content", "")
+                for m in msgs):
+                injected = dict(msgs[0])
+                injected["content"] = f"{THINKING_PREFIX} {injected.get('content', '')}"
+                fwd["messages"] = [injected] + msgs[1:]
+        return await self._router.acompletion(**fwd, stream=True, num_retries=2)
+
     async def acompletion(self, nodes_table: NodeTable, body: dict, capacity=None, tiers=None):
         """真正入口: 用 LiteLLM Router 执行请求 (非流式)。"""
         self._refresh(nodes_table, capacity, tiers)

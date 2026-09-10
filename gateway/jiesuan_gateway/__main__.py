@@ -217,7 +217,23 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
 
     # ---- L-Prod (LiteLLM) 路径: 路由/failover/重试全权交给 Router ----
     if node is None and st.scheduler.name.startswith("L-Prod"):
+        wants_stream = bool(body.get("stream"))
         try:
+            if wants_stream:
+                # 流式: Router.astream → SSE 透传
+                stream = await st.scheduler.astream(st.nodes, body, st.capacity, st.tiers)  # type: ignore[union-attr]
+                resp = web.StreamResponse(status=200,
+                                          headers={"Content-Type": "text/event-stream",
+                                                   "Cache-Control": "no-cache"})
+                await resp.prepare(request)
+                async for chunk in stream:
+                    piece = chunk.model_dump_json() if hasattr(chunk, "model_dump_json") else json.dumps(chunk)
+                    await resp.write(f"data: {piece}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
+                await resp.write_eof()
+                _trace(st, rid=rid, event="done", node="litellm-router",
+                       elapsed=round(time.time() - t0, 3), status=200, stream=True)
+                return resp
             resp = await st.scheduler.acompletion(st.nodes, body, st.capacity, st.tiers)  # type: ignore[union-attr]
             _trace(st, rid=rid, event="done", node="litellm-router",
                    elapsed=round(time.time() - t0, 3), status=200)
