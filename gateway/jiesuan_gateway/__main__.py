@@ -112,6 +112,13 @@ SCHEDULERS: dict[str, type[Scheduler]] = {
 }
 
 
+def _get_scheduler(name: str) -> Scheduler:
+    if name == "litellm":
+        from jiesuan_gateway.litellm_scheduler import LiteLLMScheduler
+        return LiteLLMScheduler()
+    return SCHEDULERS.get(name, RoundRobin)()
+
+
 # ---------------------------------------------------------------- gateway app
 
 @dataclass
@@ -191,6 +198,20 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
 
     nodes = st.nodes.alive(model=model)
     node = st.scheduler.pick(nodes, model, {"rid": rid})
+    t0 = time.time()
+
+    # ---- L-Prod (LiteLLM) 路径: 路由/failover/重试全权交给 Router ----
+    if node is None and st.scheduler.name.startswith("L-Prod"):
+        try:
+            resp = await st.scheduler.acompletion(st.nodes, body)  # type: ignore[union-attr]
+            _trace(st, rid=rid, event="done", node="litellm-router",
+                   elapsed=round(time.time() - t0, 3), status=200)
+            payload = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+            return web.json_response(payload)
+        except Exception as e:  # noqa: BLE001
+            _trace(st, rid=rid, event="error", node="litellm-router", err=str(e)[:160])
+            return web.json_response({"error": f"litellm router: {e}"}, status=502)
+
     if node is None:
         return web.json_response(
             {"error": f"no alive node serving model '{model}' "
@@ -245,7 +266,7 @@ async def make_app(st: GatewayState) -> web.Application:
 
 
 async def amain(args: argparse.Namespace) -> None:
-    sched = SCHEDULERS.get(args.scheduler, RoundRobin)()
+    sched = _get_scheduler(args.scheduler)
     st = GatewayState(scheduler=sched, trace_path=args.trace)
     # 静态哑节点: --static-node name=win,url=http://ip:11434,models=qwen3:4b (可重复)
     for spec in args.static_node or []:
@@ -270,8 +291,8 @@ def main() -> None:
     ap = argparse.ArgumentParser("jiesuan-gateway")
     ap.add_argument("--mode", choices=["solo", "pool", "network"], default="pool")
     ap.add_argument("--port", type=int, default=7800)
-    ap.add_argument("--scheduler", choices=list(SCHEDULERS), default="L1",
-                    help="L0=roundrobin L1=leastpending")
+    ap.add_argument("--scheduler", default="L1",
+                    help="L0=roundrobin L1=leastpending litellm=L-Prod(latency+failover)")
     ap.add_argument("--trace", default="trace.jsonl")
     ap.add_argument("--static-node", action="append",
                     help="哑节点: name=X,url=http://ip:11434,models=m1;m2 (无agent, 引擎直连)")
