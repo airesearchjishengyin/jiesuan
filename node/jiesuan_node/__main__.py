@@ -256,19 +256,78 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
                 return web.json_response({"error": f"prima engine error: {e}"}, status=502)
         
         # Ollama engine (default)
-        body = await request.read()
+        body = await request.json()
         url = yarl.URL(f"{st.engine_url}/api/chat")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+        wants_stream = bool(body.get("stream", True))
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(url, data=body,
+            async with s.post(url, json=body,
                               headers={"Content-Type": "application/json"}) as up:
+                if not wants_stream:
+                    # 非流式: Ollama 返回单 JSON → 转 OpenAI 格式
+                    ollama_obj = await up.json(content_type=None)
+                    payload = {
+                        "id": f"chatcmpl-{int(time.time() * 1000)}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": ollama_obj.get("model", ""),
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": ollama_obj.get("message", {}).get("content", ""),
+                            },
+                            "finish_reason": ollama_obj.get("done_reason") or "stop",
+                        }],
+                        "usage": {
+                            "prompt_tokens": ollama_obj.get("prompt_eval_count", 0),
+                            "completion_tokens": ollama_obj.get("eval_count", 0),
+                            "total_tokens": ollama_obj.get("prompt_eval_count", 0)
+                            + ollama_obj.get("eval_count", 0),
+                        },
+                    }
+                    return web.json_response(payload)
+                # 流式: Ollama ndjson → 转 OpenAI SSE (Hermes 才能解析)
                 resp = web.StreamResponse(
-                    status=up.status,
-                    headers={"Content-Type": up.headers.get(
-                        "Content-Type", "application/json")})
+                    status=200,
+                    headers={"Content-Type": "text/event-stream",
+                             "Cache-Control": "no-cache"})
                 await resp.prepare(request)
+                cid = f"chatcmpl-{int(time.time() * 1000)}"
+                created = int(time.time())
+                buf = b""
+                finish = "stop"
                 async for chunk in up.content.iter_any():
-                    await resp.write(chunk)
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        content = obj.get("message", {}).get("content", "")
+                        if obj.get("done"):
+                            finish = obj.get("done_reason") or "stop"
+                            continue
+                        delta = {"content": content} if content else {}
+                        sse = {
+                            "id": cid, "object": "chat.completion.chunk",
+                            "created": created, "model": obj.get("model", ""),
+                            "choices": [{"index": 0, "delta": delta,
+                                         "finish_reason": None}],
+                        }
+                        await resp.write(f"data: {json.dumps(sse, ensure_ascii=False)}\n\n".encode())
+                final = {
+                    "id": cid, "object": "chat.completion.chunk",
+                    "created": created, "model": "ollama",
+                    "choices": [{"index": 0, "delta": {},
+                                 "finish_reason": finish}],
+                }
+                await resp.write(f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
                 await resp.write_eof()
                 return resp
     except Exception as e:  # noqa: BLE001
