@@ -83,6 +83,26 @@ python -m jiesuan_node --name office-mac --gateway <网关IP>:7800 --pull
 | 断线感知 | 心跳超时 (~20s) | 连接断开即感知 |
 | 适用 | 自家内网机器 | 办公网/云/租用机器 |
 
+### 压测工具链 (scripts/, 单机模拟集群)
+
+```bash
+# 1. 起 50 台 mock 异构舰队 (可指定数量和网关; ~40MB/节点)
+scripts/spawn_fleet.sh 50 127.0.0.1:7800
+
+# 2. 打负载 (并发 总数 模型)
+.venv/bin/python scripts/loadtest.py 50 300 qwen3:4b
+
+# 3. 分析 trace (路由分布/延迟分位/错误)
+.venv/bin/python scripts/analyze_trace.py trace.jsonl
+
+# 4. 清理舰队 (只杀 --mock 进程, 不碰真实节点)
+scripts/stop_fleet.sh
+```
+
+50 节点实测结论 (M5 Air 单机): 4b 300请求并发50 → 97.7% 成功 (失败全部来自故意注入的
+fail_p), p50=272ms; 14b 150请求 → 96.7%, p50=103ms; 负载中杀 20% 节点成功率仅降 0.4pt。
+压测曾抓出 2 个调度 bug (模型名前缀误匹配 / L1 并局 newest 偏置), 已修复。
+
 ## 架构
 
 ```

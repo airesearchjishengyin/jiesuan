@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -61,9 +62,13 @@ class NodeTable:
         now = time.time()
         nodes = [n for n in self._nodes.values() if now - n.last_seen <= HEARTBEAT_TIMEOUT]
         if model:
-            # 精确匹配或兼容 "name:tag" 前缀匹配
-            nodes = [n for n in nodes
-                     if model in n.models or any(m.split(":")[0] == model.split(":")[0] for m in n.models)]
+            # 匹配优先级: 精确 > 节点有同名无tag基础名。不同tag (qwen3:4b vs qwen3:14b) 不互配!
+            base = model.split(":")[0]
+            exact = [n for n in nodes if model in n.models]
+            if exact:
+                nodes = exact
+            else:
+                nodes = [n for n in nodes if base in n.models]
         return nodes
 
     def get(self, name: str) -> NodeEntry | None:
@@ -99,13 +104,15 @@ class RoundRobin(Scheduler):
 
 
 class LeastPending(Scheduler):
-    """L1: 负载感知 — pending 最少优先, 并列时选最近心跳的 (更活)。"""
+    """L1: 负载感知 — pending 最少优先, 并列时随机 (避免心跳 newest 偏置)。
+    RTT 感知 (EWMA × pending) 是 v0.4 跨网调度目标, 见 docs/ch09。"""
     name = "L1-leastpending"
 
     def pick(self, nodes: list[NodeEntry], model: str, req_meta: dict) -> NodeEntry | None:
         if not nodes:
             return None
-        return min(nodes, key=lambda n: (n.pending, -n.last_seen))
+        best = min(n.pending for n in nodes)
+        return random.choice([n for n in nodes if n.pending == best])
 
 
 SCHEDULERS: dict[str, type[Scheduler]] = {
