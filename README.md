@@ -27,6 +27,21 @@ curl http://localhost:7800/v1/chat/completions \
   -d '{"model":"qwen3:14b","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+## 日常使用 (本机 Mac)
+
+三个脚本在 `scripts/`, 不用记参数, 也不需要每次找 agent 开关:
+
+```bash
+~/jiesuan/scripts/start.sh    # 开机: 自动起 Ollama(若没跑) → 网关 :7800 → 本机节点 mac-air
+~/jiesuan/scripts/stop.sh     # 关机: 停网关+节点 (不动 Ollama, 其他任务可能共用)
+~/jiesuan/scripts/status.sh   # 看状态: 三个组件各自的存活情况 + 已注册模型列表
+```
+
+- **控制台**: http://127.0.0.1:7800/dashboard (打不开 = 网关没跑, 先 `status.sh` 再 `start.sh`)
+- **Hermes 里用**: `/model js` 切到 jiesuan-local (127.0.0.1:7800/v1, 默认 qwen3.5:9b); 换模型后**首请求冷加载 1-2 分钟**, 之后约 5 秒
+- **日志**: `/tmp/jiesuan_gateway.log` 和 `/tmp/jiesuan_node.log`
+- **注意**: 脚本用 nohup 启动, 关掉终端不影响运行; 但 **Mac 重启后需要重新 `start.sh`** (如需开机自启可配 launchd, 找 agent)
+
 ## 架构
 
 ```
