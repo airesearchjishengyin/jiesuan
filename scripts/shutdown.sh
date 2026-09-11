@@ -42,6 +42,13 @@ if "--kill-ollama" in __import__("sys").argv:
     pass
 EOF
 
+# GPUsMarket host 代理 (KeepAlive) 会守护并拉起 Ollama — 彻底关闭时一起停
+pkill -f "gpusmarket" 2>/dev/null
+launchctl bootout gui/$(id -u)/com.gpusmarket.host 2>/dev/null || true
+[ -f "$HOME/Library/LaunchAgents/com.gpusmarket.host.plist" ] && \
+  mv "$HOME/Library/LaunchAgents/com.gpusmarket.host.plist" \
+     "$HOME/Library/LaunchAgents/com.gpusmarket.host.plist.disabled" 2>/dev/null || true
+
 if [ "$1" = "--kill-ollama" ]; then
   echo "[shutdown] 3/3 退出 Ollama 应用..."
   osascript -e 'quit app "Ollama"' 2>/dev/null || true
