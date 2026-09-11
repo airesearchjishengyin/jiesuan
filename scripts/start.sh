@@ -14,6 +14,9 @@ fi
 # 1. Ollama (节点的推理引擎)
 if ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
   echo "[start] 启动 Ollama ..."
+  # 16GB 机器内存治理: 最多驻留1个模型 (防多模型堆叠→swap风暴) + 空闲5分钟卸载
+  launchctl setenv OLLAMA_MAX_LOADED_MODELS 1 2>/dev/null || true
+  launchctl setenv OLLAMA_KEEP_ALIVE 5m 2>/dev/null || true
   open -a Ollama 2>/dev/null || ollama serve >/dev/null 2>&1 &
   for i in $(seq 1 15); do
     curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null && break
