@@ -44,7 +44,12 @@ EOF
 
 if [ "$1" = "--kill-ollama" ]; then
   echo "[shutdown] 3/3 退出 Ollama 应用..."
-  osascript -e 'quit app "Ollama"' 2>/dev/null && echo "  ✓ Ollama 已退出" || echo "  · Ollama 未在运行"
+  osascript -e 'quit app "Ollama"' 2>/dev/null || true
+  sleep 1
+  # osascript 只退 GUI 壳, serve 常被父进程自动拉起 → 兜底杀整个 app 进程组
+  pkill -f "Ollama.app" 2>/dev/null && echo "  ✓ Ollama 已退出" || echo "  ✓ 已无 Ollama 进程"
+  sleep 1
+  pgrep -fl "[o]llama" >/dev/null && echo "  ⚠ 仍有残留, 手动: pkill -f 'Ollama.app'" || echo "  ✓ 确认无 ollama 进程"
 else
   echo "[shutdown] 3/3 保留 Ollama (如需连它一起关: scripts/shutdown.sh --kill-ollama)"
 fi
