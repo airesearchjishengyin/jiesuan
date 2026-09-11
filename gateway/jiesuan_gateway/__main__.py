@@ -39,6 +39,7 @@ class NodeEntry:
     last_seen: float = field(default_factory=time.time)
     proxy_url: str = ""          # http://ip:port (节点代理端点)
     kind: str = "agent"          # agent=有jiesuan-node代理 / engine=哑节点直连Ollama
+    transport: str = "push"      # push=网关主动POST节点 / ws=节点pull长连接 (穿NAT)
 
     def chat_url(self) -> str:
         """回源地址: agent节点走 /v1/chat/completions 代理; 哑节点直连 Ollama /api/chat。"""
@@ -133,6 +134,8 @@ class GatewayState:
     tiers: "TierConfig | None" = None
     capacity: "CapacityManager | None" = None
     manually_offline: set = field(default_factory=set)  # 手动摘流的节点名 (admin 控制)
+    pull_conns: dict = field(default_factory=dict)      # name → ws (pull 节点的长连接)
+    pending_ws: dict = field(default_factory=dict)      # rid → Future (等待 pull 节点回包)
 
     def bootstrap_static(self) -> None:
         """把 --static-node 配置注册进节点表 (哑节点: 引擎直连, 无心跳, 常驻)。"""
@@ -197,8 +200,97 @@ async def list_nodes(request: web.Request) -> web.Response:
     now = time.time()
     out = [{"name": n.name, "os": n.os, "arch": n.arch, "models": n.models,
             "pending": n.pending, "alive": now - n.last_seen <= HEARTBEAT_TIMEOUT,
-            "proxy": n.proxy_url} for n in st.nodes.all()]
+            "proxy": n.proxy_url, "transport": n.transport} for n in st.nodes.all()]
     return web.json_response({"scheduler": st.scheduler.name, "nodes": out})
+
+
+# ---------------------------------------------------------------- pull mode (WS)
+
+async def node_pull(request: web.Request) -> web.WebSocketResponse:
+    """节点 pull 入口: 节点出站 WS 挂进来, 网关沿连接下发请求 (穿 NAT)。"""
+    st: GatewayState = request.app["state"]
+    ws = web.WebSocketResponse(heartbeat=15)
+    await ws.prepare(request)
+    name: str | None = None
+
+    async for msg in ws:
+        if msg.type != aiohttp.WSMsgType.TEXT:
+            break
+        try:
+            d = json.loads(msg.data)
+        except Exception:  # noqa: BLE001
+            continue
+        mtype = d.get("type")
+
+        if mtype == "register":
+            name = str(d["name"])
+            e = NodeEntry(
+                name=name, os=d.get("os", ""), arch=d.get("arch", ""),
+                models=d.get("models", []), pending=d.get("pending", 0),
+                last_seen=time.time(), proxy_url=f"ws://pull-conn/{name}",
+                transport="ws",
+            )
+            old = st.pull_conns.get(name)
+            if old is not None and old is not ws:
+                await old.close(code=4000, message=b"replaced by new connection")
+            st.pull_conns[name] = ws
+            st.nodes.upsert(e)
+            print(f"[gw] +pull-node {e.name} ({e.os}/{e.arch}) models={e.models} "
+                  f"via outbound ws", flush=True)
+
+        elif mtype == "heartbeat":
+            if name is None:
+                continue
+            e = st.nodes.get(name)
+            if e is not None:
+                e.last_seen = time.time()
+                e.pending = d.get("pending", e.pending)
+                e.models = d.get("models", e.models)
+                # CapacityManager 指令经 WS 下发
+                if st.capacity is not None:
+                    d2 = dict(d)
+                    d2["engine_url"] = e.proxy_url
+                    cap_res = st.capacity.on_heartbeat(d2)
+                    for c in cap_res.get("commands", []):
+                        await ws.send_json({"op": "command", "command": c})
+
+        elif mtype == "result" or d.get("op") == "result":
+            fut = st.pending_ws.pop(d.get("rid"), None)
+            if fut is not None and not fut.done():
+                fut.set_result(d)
+
+    # 连接断开 → 节点立即失效 (对比 push 要等心跳超时)
+    if name is not None and st.pull_conns.get(name) is ws:
+        st.pull_conns.pop(name, None)
+        e = st.nodes.get(name)
+        if e is not None:
+            e.last_seen = 0.0
+        print(f"[gw] -pull-node {name} (ws closed)", flush=True)
+    return ws
+
+
+async def dispatch_ws(st: GatewayState, node: NodeEntry, rid: int,
+                      body: dict) -> tuple[int, bytes] | None:
+    """经 pull 隧道下发一个 chat 请求并等待完整结果。返回 (status, body_bytes)。"""
+    ws = st.pull_conns.get(node.name)
+    if ws is None or ws.closed:
+        return None
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    st.pending_ws[rid] = fut
+    try:
+        await ws.send_json({"op": "chat", "rid": rid, "body": body})
+        result = await asyncio.wait_for(fut, timeout=600)
+    except asyncio.TimeoutError:
+        st.pending_ws.pop(rid, None)
+        return None
+    except Exception:
+        st.pending_ws.pop(rid, None)
+        return None
+    payload = result.get("payload", "")
+    if "error" in payload[:40] and payload.startswith("{\"error\""):
+        return 502, payload.encode()
+    return 200, payload.encode()
 
 
 async def chat_completions(request: web.Request) -> web.StreamResponse:
@@ -253,6 +345,15 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     _trace(st, rid=rid, event="route", model=model, node=node.name,
            sched=st.scheduler.name, candidates=[n.name for n in nodes])
     try:
+        # ---- pull (ws) 节点: 经出站隧道下发, 无需节点可达 ----
+        if node.transport == "ws":
+            res = await dispatch_ws(st, node, rid, body)
+            if res is None:
+                _trace(st, rid=rid, event="error", node=node.name, err="ws tunnel gone")
+                return web.json_response({"error": f"node {node.name} tunnel lost"}, status=502)
+            status, payload = res
+            return web.Response(status=status, body=payload,
+                                content_type="application/x-ndjson")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.post(yarl.URL(node.chat_url()),
@@ -288,6 +389,7 @@ async def make_app(st: GatewayState) -> web.Application:
     app["state"] = st
     app.router.add_post("/node/register", node_register)
     app.router.add_post("/node/heartbeat", node_heartbeat)
+    app.router.add_get("/node/pull", node_pull)
     async def list_models(request: web.Request) -> web.Response:
         return web.json_response(
             {"models": sorted({m for n in st.nodes.alive()

@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import contextlib
 import ctypes
+import json
 import platform
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ from dataclasses import dataclass, field
 import aiohttp
 import yarl
 from aiohttp import web
+
+from jiesuan_node.mock import MockEngine, MockFailure
 
 
 # ---------------------------------------------------------------- data model
@@ -40,6 +43,12 @@ class NodeState:
     started_at: float = field(default_factory=time.time)
     total_ram_gb: float = 0.0
     used_ram_gb: float = 0.0
+    # v0.3: mock (模拟引擎) / pull (出站 WebSocket, 穿 NAT)
+    mock: bool = False
+    pull: bool = False
+    port: int = 7801
+    mock_engine: "MockEngine | None" = None
+    ws_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # pull 连接的发送锁
 
 
 # ---------------------------------------------------------------- system queries
@@ -126,6 +135,33 @@ async def fetch_loaded(engine_url: str) -> list[str]:
         return []
 
 
+async def gather_facts(st: NodeState) -> None:
+    """心跳前采集引擎事实 — 真实引擎或 mock 替身, 同一 NodeState 字段。"""
+    if st.mock and st.mock_engine is not None:
+        me = st.mock_engine
+        st.total_ram_gb, st.used_ram_gb = await me.ram()
+        st.idle = await me.idle()
+        st.loaded_models = list(me.loaded)
+        st.models = list(me.model_list)
+        return
+    st.total_ram_gb, st.used_ram_gb = query_memory()
+    st.idle = query_idle()
+    st.loaded_models = await fetch_loaded(st.engine_url)
+    if not st.models:
+        st.models = await fetch_models(st.engine_url)
+
+
+async def exec_command(st: NodeState, op: str, model: str) -> None:
+    """执行网关容量指令 — mock 或真实引擎。"""
+    if st.mock and st.mock_engine is not None:
+        fn = st.mock_engine.load if op == "load_model" else st.mock_engine.unload
+        ok = await fn(model)
+    else:
+        fn = exec_load if op == "load_model" else exec_unload
+        ok = await fn(st.engine_url, model)
+    print(f"[node] executing {op} {model} → {'ok' if ok else 'FAILED'}", flush=True)
+
+
 # ---------------------------------------------------------------- commands
 
 async def exec_load(engine_url: str, model: str, keep_alive: str = "30m") -> bool:
@@ -162,6 +198,23 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
     st: NodeState = request.app["state"]
     st.pending += 1
     try:
+        if st.mock and st.mock_engine is not None:
+            body = await request.json()
+            gen = st.mock_engine.chat_lines(body)
+            try:
+                first = await gen.__anext__()   # 失败注入在 prepare 前抛出 → 可干净返回 502
+            except StopAsyncIteration:
+                return web.json_response({"error": "mock produced no output"}, status=502)
+            except MockFailure as e:
+                return web.json_response({"error": f"mock failure: {e}"}, status=502)
+            resp = web.StreamResponse(status=200,
+                                      headers={"Content-Type": "application/x-ndjson"})
+            await resp.prepare(request)
+            await resp.write((first + "\n").encode())
+            async for line in gen:
+                await resp.write((line + "\n").encode())
+            await resp.write_eof()
+            return resp
         body = await request.read()
         url = yarl.URL(f"{st.engine_url}/api/chat")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
@@ -200,15 +253,12 @@ async def heartbeat_loop(st: NodeState, interval: float = 5.0) -> None:
     first = True
     while True:
         try:
-            st.total_ram_gb, st.used_ram_gb = query_memory()
-            st.idle = query_idle()
-            st.loaded_models = await fetch_loaded(st.engine_url)
-            if not st.models:
-                st.models = await fetch_models(st.engine_url)
+            await gather_facts(st)
 
             payload = {
                 "type": "register" if first else "heartbeat",
                 "name": st.name,
+                "port": st.port,
                 "os": st.os_info,
                 "arch": st.arch,
                 "models": st.models,
@@ -228,12 +278,9 @@ async def heartbeat_loop(st: NodeState, interval: float = 5.0) -> None:
                         backoff = interval
                         cmd = await r.json(content_type=None) or {}
                         for c in cmd.get("commands", []):
-                            if c.get("op") == "load_model":
-                                print(f"[node] executing load_model {c['model']}", flush=True)
-                                await exec_load(st.engine_url, c["model"])
-                            elif c.get("op") == "unload_model":
-                                print(f"[node] executing unload_model {c['model']} (user active)", flush=True)
-                                await exec_unload(st.engine_url, c["model"])
+                            if c.get("op") in ("load_model", "unload_model"):
+                                print(f"[node] got command {c['op']} {c['model']}", flush=True)
+                                await exec_command(st, c["op"], c["model"])
                     else:
                         print(f"[node] gateway {r.status}", flush=True)
         except Exception as e:  # noqa: BLE001
@@ -242,6 +289,107 @@ async def heartbeat_loop(st: NodeState, interval: float = 5.0) -> None:
             backoff = min(backoff * 1.5, 60)
             continue
         await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------- pull mode
+
+PULL_BACKOFF_MAX = 10.0
+
+
+async def _run_payload(st: NodeState, payload: dict) -> str:
+    """本地执行一个推理 payload, 返回完整 ndjson 文本 (pull 隧道专用)。"""
+    st.pending += 1
+    try:
+        lines: list[str] = []
+        if st.mock and st.mock_engine is not None:
+            async for line in st.mock_engine.chat_lines(payload):
+                lines.append(line)
+        else:
+            timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(yarl.URL(f"{st.engine_url}/api/chat"),
+                                  json=payload) as up:
+                    if up.status != 200:
+                        return json.dumps({"error": f"engine status {up.status}"})
+                    async for chunk in up.content.iter_any():
+                        lines.extend(chunk.decode(errors="replace").splitlines())
+        return "\n".join(lines)
+    finally:
+        st.pending -= 1
+
+
+async def pull_loop(st: NodeState) -> None:
+    """Pull 模式: 出站 WebSocket 挂到网关, 网关把请求沿连接派下来。
+
+    出站连接天然穿 NAT — 办公网/家庭网机器无需端口转发即可入池。
+    心跳与容量指令都走同一条 WS; 断线指数退避重连。
+    v0.3: 单节点串行执行 (ws_lock); 并发隧道是 roadmap。
+    """
+    host = st.gateway_url.split("//")[-1]
+    ws_url = f"ws://{host}/node/pull"
+    backoff = 1.0
+    while True:
+        try:
+            session = aiohttp.ClientSession()
+            try:
+                async with session.ws_connect(ws_url, heartbeat=15) as ws:
+                    print(f"[node] pull 连接已建立 → {ws_url}", flush=True)
+                    backoff = 1.0
+                    await gather_facts(st)
+                    hello = {
+                        "type": "register", "transport": "ws", "port": st.port,
+                        "name": st.name, "os": st.os_info, "arch": st.arch,
+                        "models": st.models, "loaded_models": st.loaded_models,
+                        "pending": st.pending, "idle": st.idle,
+                        "total_ram_gb": st.total_ram_gb, "used_ram_gb": st.used_ram_gb,
+                        "uptime": round(time.time() - st.started_at, 1), "ts": time.time(),
+                    }
+                    await ws.send_json(hello)
+
+                    async def hb_sender() -> None:
+                        """WS 上的周期心跳 — 网关响应可携带容量指令。"""
+                        while True:
+                            await asyncio.sleep(5.0)
+                            await gather_facts(st)
+                            await ws.send_json({
+                                "type": "heartbeat", "name": st.name,
+                                "models": st.models, "loaded_models": st.loaded_models,
+                                "pending": st.pending, "idle": st.idle,
+                                "total_ram_gb": st.total_ram_gb, "used_ram_gb": st.used_ram_gb,
+                                "uptime": round(time.time() - st.started_at, 1), "ts": time.time(),
+                            })
+
+                    hb_task = asyncio.create_task(hb_sender())
+                    try:
+                        async for msg in ws:
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                break
+                            data = json.loads(msg.data)
+                            op = data.get("op")
+                            if op == "chat":
+                                async with st.ws_lock:
+                                    try:
+                                        result = await _run_payload(st, data.get("body", {}))
+                                    except Exception as e:  # noqa: BLE001
+                                        result = json.dumps({"error": str(e)[:200]})
+                                    await ws.send_json({"type": "result", "op": "result",
+                                                        "rid": data.get("rid"),
+                                                        "node": st.name, "payload": result})
+                            elif op == "command":
+                                c = data.get("command", {})
+                                if c.get("op") in ("load_model", "unload_model"):
+                                    print(f"[node] got command {c['op']} {c['model']}", flush=True)
+                                    await exec_command(st, c["op"], c["model"])
+                    finally:
+                        hb_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await hb_task
+            finally:
+                await session.close()
+        except Exception as e:  # noqa: BLE001
+            print(f"[node] pull 断开: {e!r} → {backoff:.0f}s 后重连", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, PULL_BACKOFF_MAX)
 
 
 # ---------------------------------------------------------------- main
@@ -260,18 +408,42 @@ async def amain(args: argparse.Namespace) -> None:
         name=args.name,
         engine_url=args.engine.rstrip("/"),
         gateway_url=f"http://{args.gateway}",
+        mock=args.mock,
+        pull=args.pull,
+        port=args.port,
     )
-    st.models = await fetch_models(st.engine_url)
+    if args.mock:
+        spec = {}
+        if args.mock_spec:
+            for kv in args.mock_spec.split(","):
+                k, _, v = kv.partition("=")
+                spec[k.strip()] = v.strip()
+        from jiesuan_node.mock import MockEngine
+        st.mock_engine = MockEngine(
+            name=args.name,
+            model_list=[m for m in spec.get("models", "mock-model").split(";") if m],
+            ram_gb=float(spec.get("ram_gb", 16)),
+            delay=float(spec.get("delay", 0.2)),
+            jitter=float(spec.get("jitter", 0.1)),
+            fail_p=float(spec.get("fail_p", 0.0)),
+            busy=spec.get("busy", "") == "1",
+        )
+    st.models = list(st.mock_engine.model_list) if st.mock_engine else await fetch_models(st.engine_url)
     app = await make_app(st)
-    hb = asyncio.create_task(heartbeat_loop(st))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", args.port)
     await site.start()
+    tasks: list[asyncio.Task] = []
+    if st.pull:
+        tasks.append(asyncio.create_task(pull_loop(st)))
+    else:
+        tasks.append(asyncio.create_task(heartbeat_loop(st)))
+    mode = ("mock+pull" if st.mock else "pull") if st.pull else ("mock" if st.mock else "push")
     print(f"[node] '{st.name}' up on :{args.port} → gateway {st.gateway_url} "
-          f"(models: {', '.join(st.models) or 'none'})", flush=True)
+          f"(mode={mode}, models: {', '.join(st.models) or 'none'})", flush=True)
     with contextlib.suppress(asyncio.CancelledError):
-        await hb
+        await asyncio.gather(*tasks)
         await asyncio.Event().wait()
 
 
@@ -281,6 +453,12 @@ def main() -> None:
     ap.add_argument("--gateway", required=True)
     ap.add_argument("--engine", default="http://localhost:11434")
     ap.add_argument("--port", type=int, default=7801)
+    ap.add_argument("--pull", action="store_true",
+                    help="pull 模式: 出站 WebSocket 挂网关 (穿 NAT, 无需端口转发)")
+    ap.add_argument("--mock", action="store_true",
+                    help="mock 模式: 用 MockEngine 替代 Ollama (逻辑外推/故障注入测试)")
+    ap.add_argument("--mock-spec",
+                    help="mock 参数: models=m1;m2,ram_gb=16,delay=0.2,jitter=0.1,fail_p=0.1,busy=1")
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))

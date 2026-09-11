@@ -42,6 +42,47 @@ curl http://localhost:7800/v1/chat/completions \
 - **日志**: `/tmp/jiesuan_gateway.log` 和 `/tmp/jiesuan_node.log`
 - **注意**: 脚本用 nohup 启动, 关掉终端不影响运行; 但 **Mac 重启后需要重新 `start.sh`** (如需开机自启可配 launchd, 找 agent)
 
+## v0.3: mock 模式与 pull 模式 (逻辑外推测试 + 穿 NAT 入池)
+
+### mock 模式 — 2 台真机模拟 N 台异构节点
+
+```bash
+# 模拟一台 8GB 只装 4b 的小机器, 30% 请求失败 (故障注入)
+python -m jiesuan_node --name fake-1 --gateway 127.0.0.1:7800 --mock \
+  --mock-spec "models=qwen3:4b,ram_gb=8,delay=0.3,fail_p=0.3"
+
+# 模拟一台 32GB 大机器 (可注册大模型 → 验证异构路由)
+python -m jiesuan_node --name fake-2 --gateway 127.0.0.1:7800 --mock \
+  --mock-spec "models=qwen3:4b;qwen3:14b,ram_gb=32,delay=0.1"
+```
+
+- 输出与真实 Ollama ndjson 流完全一致, 网关与客户端零改动
+- `--mock-spec` 参数: `models`(分号分隔) `ram_gb` `delay` `jitter` `fail_p` `busy=1`
+- 可测: 异构路由 / 部分故障 / 负载竞争 / 容量指令回路 (load/unload 经心跳下发)
+- 10–50 台逻辑外推 = 单机起 N 个 mock 进程; 真 GPU 性能数据仍需真机
+
+### pull 模式 — 节点出站长连接, 穿 NAT (办公网/云主机/租用机器)
+
+```bash
+# 网关不变; 节点加 --pull 即可, 无需端口转发
+python -m jiesuan_node --name office-mac --gateway <网关IP>:7800 --pull
+```
+
+- 原理: 节点主动向网关建出站 WebSocket (`/node/pull`), 请求沿连接下发 — 出站连接天然穿 NAT
+- 与 push 模式 (默认) 可混跑: 网关按节点的 transport 自动选择下发路径
+- pull 节点断线秒级暴露 (对比 push 需等心跳超时); 心跳与容量指令复用同一条 WS
+- v0.3 限制: 单节点串行执行; 完整 ndjson 攒齐后一次回传 (网关侧收齐再返回)
+- 适用: EigenFlux 志愿者办公机器 / GPUsMarket Docker 租用机 — 都在 NAT 后, 只有 pull 能入池
+
+### push vs pull 怎么选
+
+| | push (默认) | pull (--pull) |
+|---|---|---|
+| 网络要求 | 节点必须被网关主动连到 (同内网/可路由) | 只要节点能出站上网 |
+| 流式 | 逐 chunk 透传 | 整体回传 (v0.3) |
+| 断线感知 | 心跳超时 (~20s) | 连接断开即感知 |
+| 适用 | 自家内网机器 | 办公网/云/租用机器 |
+
 ## 架构
 
 ```
