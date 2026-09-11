@@ -313,9 +313,15 @@ async def dispatch_ws(st: GatewayState, node: NodeEntry, rid: int,
 async def chat_completions(request: web.Request) -> web.StreamResponse:
     """OpenAI 兼容入口: 选节点 → 回源代理 → 流式返回。"""
     st: GatewayState = request.app["state"]
-    # 公网模式: 数据面鉴权 (防止网关地址泄露后被滥用)
-    if st.api_key and request.headers.get("Authorization") != f"Bearer {st.api_key}":
-        return web.json_response({"error": "unauthorized"}, status=401)
+    # 数据面鉴权 (--api-key):
+    #   - 本机回环 (Hermes /model js 等) 且非经 CF 隧道 → 信任放行, 免 Bearer
+    #   - 经 CF Tunnel 的公网请求 (带 CF-Connecting-IP) 或非回环来源 → 必须 Bearer
+    if st.api_key:
+        peer = request.remote or ""
+        trusted_local = (peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+                         and "CF-Connecting-IP" not in request.headers)
+        if not trusted_local and request.headers.get("Authorization") != f"Bearer {st.api_key}":
+            return web.json_response({"error": "unauthorized"}, status=401)
     st.req_counter += 1
     rid = st.req_counter
     body = await request.json()
