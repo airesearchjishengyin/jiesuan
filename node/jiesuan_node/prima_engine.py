@@ -377,6 +377,3 @@ def add_prima_args(parser: argparse.ArgumentParser) -> None:
                    help="上下文长度")
     g.add_argument("--prima-model", default="",
                    help="启动时加载的模型文件名")
-
-
-import argparse  # 放这里避免循环导入

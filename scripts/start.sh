@@ -7,7 +7,8 @@ PY="$PWD/.venv/bin/python"
 
 # 公网鉴权 token (存在 .env 则加载: JIESUAN_NODE_TOKEN / JIESUAN_API_KEY)
 if [ -f .env ]; then
-  set -a; source .env; set +a
+  # 只加载合法 KEY=VALUE 行 (坏行/注释自动跳过, 不因手误卡死启动)
+  set -a; eval "$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)"; set +a
 fi
 
 # 1. Ollama (节点的推理引擎)
