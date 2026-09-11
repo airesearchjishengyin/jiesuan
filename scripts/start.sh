@@ -5,6 +5,11 @@ set -e
 cd "$(dirname "$0")/.."
 PY="$PWD/.venv/bin/python"
 
+# 公网鉴权 token (存在 .env 则加载: JIESUAN_NODE_TOKEN / JIESUAN_API_KEY)
+if [ -f .env ]; then
+  set -a; source .env; set +a
+fi
+
 # 1. Ollama (节点的推理引擎)
 if ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
   echo "[start] 启动 Ollama ..."

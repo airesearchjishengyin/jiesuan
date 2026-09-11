@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import random
 import time
 from abc import ABC, abstractmethod
@@ -143,6 +144,8 @@ class GatewayState:
     manually_offline: set = field(default_factory=set)  # 手动摘流的节点名 (admin 控制)
     pull_conns: dict = field(default_factory=dict)      # name → ws (pull 节点的长连接)
     pending_ws: dict = field(default_factory=dict)      # rid → Future (等待 pull 节点回包)
+    node_token: str = ""    # 公网模式: 节点注册/心跳鉴权 (空=不鉴权, 仅限内网)
+    api_key: str = ""       # 公网模式: /v1 数据面 Bearer 鉴权 (空=不鉴权)
 
     def bootstrap_static(self) -> None:
         """把 --static-node 配置注册进节点表 (哑节点: 引擎直连, 无心跳, 常驻)。"""
@@ -214,7 +217,10 @@ async def list_nodes(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------- pull mode (WS)
 
 async def node_pull(request: web.Request) -> web.WebSocketResponse:
-    """节点 pull 入口: 节点出站 WS 挂进来, 网关沿连接下发请求 (穿 NAT)。"""
+    """节点 pull 入口: 节点出站 WS 挂进来, 网关沿连接下发请求 (穿 NAT)。
+
+    公网模式 (--node-token): hello 消息必须携带正确 token, 否则拒绝 (防假节点)。
+    """
     st: GatewayState = request.app["state"]
     ws = web.WebSocketResponse(heartbeat=15)
     await ws.prepare(request)
@@ -230,6 +236,10 @@ async def node_pull(request: web.Request) -> web.WebSocketResponse:
         mtype = d.get("type")
 
         if mtype == "register":
+            if st.node_token and d.get("token") != st.node_token:
+                print("[gw] ✗ pull 注册被拒: token 无效", flush=True)
+                await ws.close(code=4001, message=b"bad token")
+                break
             name = str(d["name"])
             e = NodeEntry(
                 name=name, os=d.get("os", ""), arch=d.get("arch", ""),
@@ -303,6 +313,9 @@ async def dispatch_ws(st: GatewayState, node: NodeEntry, rid: int,
 async def chat_completions(request: web.Request) -> web.StreamResponse:
     """OpenAI 兼容入口: 选节点 → 回源代理 → 流式返回。"""
     st: GatewayState = request.app["state"]
+    # 公网模式: 数据面鉴权 (防止网关地址泄露后被滥用)
+    if st.api_key and request.headers.get("Authorization") != f"Bearer {st.api_key}":
+        return web.json_response({"error": "unauthorized"}, status=401)
     st.req_counter += 1
     rid = st.req_counter
     body = await request.json()
@@ -427,7 +440,12 @@ async def amain(args: argparse.Namespace) -> None:
     except (aiohttp.ClientConnectorError, asyncio.TimeoutError, OSError):
         pass  # 端口空闲 → 正常启动
     sched = _get_scheduler(args.scheduler)
-    st = GatewayState(scheduler=sched, trace_path=args.trace)
+    st = GatewayState(scheduler=sched, trace_path=args.trace,
+                      node_token=args.node_token, api_key=args.api_key)
+    if st.node_token:
+        print(f"[gw] 公网模式: 节点鉴权 ON", flush=True)
+    if st.api_key:
+        print(f"[gw] 公网模式: /v1 Bearer 鉴权 ON", flush=True)
     # 静态哑节点: --static-node name=win,url=http://ip:11434,models=qwen3:4b (可重复)
     for spec in args.static_node or []:
         parts = dict(kv.split("=", 1) for kv in spec.split(",") if "=" in kv)
@@ -470,6 +488,10 @@ def main() -> None:
                     help="哑节点: name=X,url=http://ip:11434,models=m1;m2 (无agent, 引擎直连)")
     ap.add_argument("--tier", action="append", metavar="HIGH=qwen3:14b",
                     help="档位声明: high/mid/low=模型名 (启用 ADR-003 容量调度)")
+    ap.add_argument("--node-token", default=os.environ.get("JIESUAN_NODE_TOKEN", ""),
+                    help="公网模式: 节点注册鉴权 token (或环境变量 JIESUAN_NODE_TOKEN)")
+    ap.add_argument("--api-key", default=os.environ.get("JIESUAN_API_KEY", ""),
+                    help="公网模式: /v1 Bearer 鉴权 (或环境变量 JIESUAN_API_KEY)")
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))

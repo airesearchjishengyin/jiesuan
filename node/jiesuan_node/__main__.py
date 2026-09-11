@@ -3,11 +3,12 @@
 职责:
   1. 启动时向网关注册 (name, engine 能力, 模型清单, 容量/idle 状态)
   2. 周期心跳 (健康 + pending + 容量 + idle) — 网关响应可携带指令
-  3. 暴露本地推理引擎 (Ollama) 的代理端点给网关回源
+  3. 暴露本地推理引擎 (Ollama/Prima.cpp) 的代理端点给网关回源
   4. 执行网关指令: load_model / unload_model (ADR-003 容量状态机的执行端)
 
 用法:
   python -m jiesuan_node --name mac-air --gateway 192.168.1.5:7800 [--engine http://localhost:11434]
+  python -m jiesuan_node --name mac-air --gateway 192.168.1.5:7800 --engine-type prima --prima-role head --prima-model qwen2.5-7b-instruct-q4_k_m.gguf
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import asyncio
 import contextlib
 import ctypes
 import json
+import os
 import platform
 import time
 from dataclasses import dataclass, field
@@ -25,6 +27,7 @@ import yarl
 from aiohttp import web
 
 from jiesuan_node.mock import MockEngine, MockFailure
+from jiesuan_node.prima_engine import PrimaEngine, PrimaConfig, add_prima_args, create_prima_config_from_args
 
 
 # ---------------------------------------------------------------- data model
@@ -47,6 +50,7 @@ class NodeState:
     mock: bool = False
     pull: bool = False
     port: int = 7801
+    node_token: str = ""     # 公网模式节点鉴权 (wss 网关要求时必填)
     mock_engine: "MockEngine | None" = None
     ws_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # pull 连接的发送锁
 
@@ -135,7 +139,7 @@ async def fetch_loaded(engine_url: str) -> list[str]:
         return []
 
 
-async def gather_facts(st: NodeState) -> None:
+async def gather_facts(st: NodeState, prima_engine: PrimaEngine | None = None) -> None:
     """心跳前采集引擎事实 — 真实引擎或 mock 替身, 同一 NodeState 字段。"""
     if st.mock and st.mock_engine is not None:
         me = st.mock_engine
@@ -144,6 +148,18 @@ async def gather_facts(st: NodeState) -> None:
         st.loaded_models = list(me.loaded)
         st.models = list(me.model_list)
         return
+    
+    if prima_engine is not None:
+        # Prima.cpp engine: 从引擎获取容量信息
+        cap = prima_engine.get_capacity_info()
+        st.total_ram_gb = cap.get("total_ram_gb", 0.0)
+        st.used_ram_gb = cap.get("used_ram_gb", 0.0)
+        st.idle = cap.get("idle", True)
+        st.models = cap.get("models", [])
+        st.loaded_models = cap.get("loaded_models", [])
+        return
+    
+    # Ollama engine (default)
     st.total_ram_gb, st.used_ram_gb = query_memory()
     st.idle = query_idle()
     st.loaded_models = await fetch_loaded(st.engine_url)
@@ -151,10 +167,13 @@ async def gather_facts(st: NodeState) -> None:
         st.models = await fetch_models(st.engine_url)
 
 
-async def exec_command(st: NodeState, op: str, model: str) -> None:
-    """执行网关容量指令 — mock 或真实引擎。"""
+async def exec_command(st: NodeState, op: str, model: str, prima_engine: PrimaEngine | None = None) -> None:
+    """执行网关容量指令 — mock、prima.cpp 或真实 Ollama 引擎。"""
     if st.mock and st.mock_engine is not None:
         fn = st.mock_engine.load if op == "load_model" else st.mock_engine.unload
+        ok = await fn(model)
+    elif prima_engine is not None:
+        fn = prima_engine.load_model if op == "load_model" else prima_engine.unload_model
         ok = await fn(model)
     else:
         fn = exec_load if op == "load_model" else exec_unload
@@ -196,6 +215,7 @@ async def exec_unload(engine_url: str, model: str) -> bool:
 
 async def proxy_chat(request: web.Request) -> web.StreamResponse:
     st: NodeState = request.app["state"]
+    prima_engine: PrimaEngine | None = request.app.get("prima_engine")
     st.pending += 1
     try:
         if st.mock and st.mock_engine is not None:
@@ -215,6 +235,27 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
                 await resp.write((line + "\n").encode())
             await resp.write_eof()
             return resp
+        
+        # Prima.cpp engine
+        if prima_engine is not None:
+            body = await request.json()
+            stream = body.get("stream", True)
+            try:
+                result = await prima_engine.chat_completions(body, stream=stream)
+                if stream:
+                    resp = web.StreamResponse(status=200,
+                                              headers={"Content-Type": "application/x-ndjson"})
+                    await resp.prepare(request)
+                    async for chunk in result:
+                        await resp.write(chunk)
+                    await resp.write_eof()
+                    return resp
+                else:
+                    return web.json_response(result)
+            except Exception as e:
+                return web.json_response({"error": f"prima engine error: {e}"}, status=502)
+        
+        # Ollama engine (default)
         body = await request.read()
         url = yarl.URL(f"{st.engine_url}/api/chat")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
@@ -223,7 +264,8 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
                               headers={"Content-Type": "application/json"}) as up:
                 resp = web.StreamResponse(
                     status=up.status,
-                    headers={"Content-Type": up.headers.get("Content-Type", "application/json")})
+                    headers={"Content-Type": up.headers.get(
+                        "Content-Type", "application/json")})
                 await resp.prepare(request)
                 async for chunk in up.content.iter_any():
                     await resp.write(chunk)
@@ -237,23 +279,43 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
 
 async def proxy_models(request: web.Request) -> web.Response:
     st: NodeState = request.app["state"]
+    prima_engine: PrimaEngine | None = request.app.get("prima_engine")
+    if prima_engine is not None:
+        models = await prima_engine.list_models()
+        return web.json_response({"node": st.name, "models": models})
     models = await fetch_models(st.engine_url)
     return web.json_response({"node": st.name, "models": models})
 
 
 async def health(request: web.Request) -> web.Response:
     st: NodeState = request.app["state"]
+    prima_engine: PrimaEngine | None = request.app.get("prima_engine")
+    if prima_engine is not None:
+        health_info = await prima_engine.health_check()
+        return web.json_response({"node": st.name, "ok": health_info.get("ok", False), "pending": st.pending, "engine": "prima", "details": health_info})
     return web.json_response({"node": st.name, "ok": True, "pending": st.pending})
+
+
+# ---------------------------------------------------------------- main
+
+async def make_app(st: NodeState, prima_engine: PrimaEngine | None = None) -> web.Application:
+    app = web.Application()
+    app["state"] = st
+    app["prima_engine"] = prima_engine
+    app.router.add_post("/v1/chat/completions", proxy_chat)
+    app.router.add_get("/v1/models", proxy_models)
+    app.router.add_get("/health", health)
+    return app
 
 
 # ---------------------------------------------------------------- heartbeat
 
-async def heartbeat_loop(st: NodeState, interval: float = 5.0) -> None:
+async def heartbeat_loop(st: NodeState, prima_engine: PrimaEngine | None, interval: float = 5.0) -> None:
     backoff = interval
     first = True
     while True:
         try:
-            await gather_facts(st)
+            await gather_facts(st, prima_engine)
 
             payload = {
                 "type": "register" if first else "heartbeat",
@@ -280,7 +342,7 @@ async def heartbeat_loop(st: NodeState, interval: float = 5.0) -> None:
                         for c in cmd.get("commands", []):
                             if c.get("op") in ("load_model", "unload_model"):
                                 print(f"[node] got command {c['op']} {c['model']}", flush=True)
-                                await exec_command(st, c["op"], c["model"])
+                                await exec_command(st, c["op"], c["model"], prima_engine)
                     else:
                         print(f"[node] gateway {r.status}", flush=True)
         except Exception as e:  # noqa: BLE001
@@ -296,7 +358,7 @@ async def heartbeat_loop(st: NodeState, interval: float = 5.0) -> None:
 PULL_BACKOFF_MAX = 10.0
 
 
-async def _run_payload(st: NodeState, payload: dict) -> str:
+async def _run_payload(st: NodeState, payload: dict, prima_engine: PrimaEngine | None = None) -> str:
     """本地执行一个推理 payload, 返回完整 ndjson 文本 (pull 隧道专用)。"""
     st.pending += 1
     try:
@@ -304,6 +366,15 @@ async def _run_payload(st: NodeState, payload: dict) -> str:
         if st.mock and st.mock_engine is not None:
             async for line in st.mock_engine.chat_lines(payload):
                 lines.append(line)
+        elif prima_engine is not None:
+            # Prima.cpp: 同步调用 chat_completions 并收集完整响应
+            result = await prima_engine.chat_completions(payload, stream=False)
+            if isinstance(result, dict):
+                # 非流式返回 JSON，转为 ndjson 格式
+                lines.append(json.dumps(result, ensure_ascii=False))
+            else:
+                # 不应该到这里，stream=False 时返回 dict
+                pass
         else:
             timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
             async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -318,15 +389,20 @@ async def _run_payload(st: NodeState, payload: dict) -> str:
         st.pending -= 1
 
 
-async def pull_loop(st: NodeState) -> None:
+async def pull_loop(st: NodeState, prima_engine: PrimaEngine | None = None) -> None:
     """Pull 模式: 出站 WebSocket 挂到网关, 网关把请求沿连接派下来。
 
-    出站连接天然穿 NAT — 办公网/家庭网机器无需端口转发即可入池。
+    出站连接天然穿 NAT — 办公网/家庭网/公网云机器统一走此模式。
+    gateway_url 支持 http:// (ws://) 与 wss:// (公网经 Cloudflare Tunnel, 必须加密)。
+    --node-token: 公网模式节点鉴权, 随 hello 下发, 网关校验失败即拒。
     心跳与容量指令都走同一条 WS; 断线指数退避重连。
-    v0.3: 单节点串行执行 (ws_lock); 并发隧道是 roadmap。
     """
-    host = st.gateway_url.split("//")[-1]
-    ws_url = f"ws://{host}/node/pull"
+    if st.gateway_url.startswith("wss://") or st.gateway_url.startswith("https://"):
+        ws_url = st.gateway_url.split("//", 1)[0] + "//" + \
+            st.gateway_url.split("//", 1)[1].rstrip("/") + "/node/pull"
+    else:
+        host = st.gateway_url.split("//")[-1]
+        ws_url = f"ws://{host}/node/pull"
     backoff = 1.0
     while True:
         try:
@@ -335,9 +411,10 @@ async def pull_loop(st: NodeState) -> None:
                 async with session.ws_connect(ws_url, heartbeat=15) as ws:
                     print(f"[node] pull 连接已建立 → {ws_url}", flush=True)
                     backoff = 1.0
-                    await gather_facts(st)
+                    await gather_facts(st, prima_engine)
                     hello = {
                         "type": "register", "transport": "ws", "port": st.port,
+                        "token": st.node_token,
                         "name": st.name, "os": st.os_info, "arch": st.arch,
                         "models": st.models, "loaded_models": st.loaded_models,
                         "pending": st.pending, "idle": st.idle,
@@ -350,7 +427,7 @@ async def pull_loop(st: NodeState) -> None:
                         """WS 上的周期心跳 — 网关响应可携带容量指令。"""
                         while True:
                             await asyncio.sleep(5.0)
-                            await gather_facts(st)
+                            await gather_facts(st, prima_engine)
                             await ws.send_json({
                                 "type": "heartbeat", "name": st.name,
                                 "models": st.models, "loaded_models": st.loaded_models,
@@ -361,6 +438,8 @@ async def pull_loop(st: NodeState) -> None:
 
                     hb_task = asyncio.create_task(hb_sender())
                     try:
+                        # 注意: 服务端 close(4001) 时 aiohttp 客户端的 async-for
+                        # 不 yield 任何消息直接结束, 拒绝检测必须读 ws.close_code
                         async for msg in ws:
                             if msg.type != aiohttp.WSMsgType.TEXT:
                                 break
@@ -369,7 +448,7 @@ async def pull_loop(st: NodeState) -> None:
                             if op == "chat":
                                 async with st.ws_lock:
                                     try:
-                                        result = await _run_payload(st, data.get("body", {}))
+                                        result = await _run_payload(st, data.get("body", {}), prima_engine)
                                     except Exception as e:  # noqa: BLE001
                                         result = json.dumps({"error": str(e)[:200]})
                                     await ws.send_json({"type": "result", "op": "result",
@@ -379,39 +458,43 @@ async def pull_loop(st: NodeState) -> None:
                                 c = data.get("command", {})
                                 if c.get("op") in ("load_model", "unload_model"):
                                     print(f"[node] got command {c['op']} {c['model']}", flush=True)
-                                    await exec_command(st, c["op"], c["model"])
+                                    await exec_command(st, c["op"], c["model"], prima_engine)
                     finally:
                         hb_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await hb_task
             finally:
                 await session.close()
+            if ws.close_code == 4001:
+                print("[node] ✗ 网关拒绝注册 (token 无效) — 检查 JIESUAN_NODE_TOKEN 后重启", flush=True)
+                raise SystemExit(3)
         except Exception as e:  # noqa: BLE001
             print(f"[node] pull 断开: {e!r} → {backoff:.0f}s 后重连", flush=True)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, PULL_BACKOFF_MAX)
 
 
-# ---------------------------------------------------------------- main
-
-async def make_app(st: NodeState) -> web.Application:
-    app = web.Application()
-    app["state"] = st
-    app.router.add_post("/v1/chat/completions", proxy_chat)
-    app.router.add_get("/v1/models", proxy_models)
-    app.router.add_get("/health", health)
-    return app
-
+# ---------------------------------------------------------------- entry point
 
 async def amain(args: argparse.Namespace) -> None:
+    # gateway 支持 host:port (ws) 或 wss://domain (公网经 CF Tunnel, 自动升级加密)
+    gw = args.gateway
+    if gw.startswith("wss://") or gw.startswith("https://"):
+        gw_url = gw if gw.startswith("wss://") else gw.replace("https://", "wss://", 1)
+    else:
+        gw_url = f"http://{gw}"
     st = NodeState(
         name=args.name,
         engine_url=args.engine.rstrip("/"),
-        gateway_url=f"http://{args.gateway}",
+        gateway_url=gw_url,
         mock=args.mock,
         pull=args.pull,
         port=args.port,
+        node_token=os.environ.get("JIESUAN_NODE_TOKEN", ""),
     )
+    
+    prima_engine: PrimaEngine | None = None
+    
     if args.mock:
         spec = {}
         if args.mock_spec:
@@ -428,20 +511,40 @@ async def amain(args: argparse.Namespace) -> None:
             fail_p=float(spec.get("fail_p", 0.0)),
             busy=spec.get("busy", "") == "1",
         )
-    st.models = list(st.mock_engine.model_list) if st.mock_engine else await fetch_models(st.engine_url)
-    app = await make_app(st)
+    elif args.engine_type == "prima":
+        # Prima.cpp engine
+        prima_config = create_prima_config_from_args(args)
+        prima_engine = PrimaEngine(prima_config)
+        # 启动 prima.cpp 进程
+        ok = await prima_engine.start()
+        if not ok:
+            print(f"[node] Failed to start prima.cpp engine", flush=True)
+            return
+        # 预加载模型列表
+        st.models = await prima_engine.list_models()
+        if prima_config.model_file:
+            st.loaded_models = [prima_config.model_file]
+    else:
+        # Ollama engine (default)
+        st.models = await fetch_models(st.engine_url)
+    
+    app = await make_app(st, prima_engine)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", args.port)
     await site.start()
+    
     tasks: list[asyncio.Task] = []
     if st.pull:
-        tasks.append(asyncio.create_task(pull_loop(st)))
+        tasks.append(asyncio.create_task(pull_loop(st, prima_engine)))
     else:
-        tasks.append(asyncio.create_task(heartbeat_loop(st)))
-    mode = ("mock+pull" if st.mock else "pull") if st.pull else ("mock" if st.mock else "push")
+        tasks.append(asyncio.create_task(heartbeat_loop(st, prima_engine)))
+    
+    engine_desc = "mock" if st.mock else ("prima" if args.engine_type == "prima" else "ollama")
+    mode = ("pull" if st.pull else "push")
     print(f"[node] '{st.name}' up on :{args.port} → gateway {st.gateway_url} "
-          f"(mode={mode}, models: {', '.join(st.models) or 'none'})", flush=True)
+          f"(engine={engine_desc}, mode={mode}, models: {', '.join(st.models) or 'none'})", flush=True)
+    
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.gather(*tasks)
         await asyncio.Event().wait()
@@ -450,7 +553,8 @@ async def amain(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser("jiesuan-node")
     ap.add_argument("--name", required=True)
-    ap.add_argument("--gateway", required=True)
+    ap.add_argument("--gateway", required=True,
+                    help="网关地址 host:port 或 wss://域名 (公网经 CF Tunnel)")
     ap.add_argument("--engine", default="http://localhost:11434")
     ap.add_argument("--port", type=int, default=7801)
     ap.add_argument("--pull", action="store_true",
@@ -459,6 +563,10 @@ def main() -> None:
                     help="mock 模式: 用 MockEngine 替代 Ollama (逻辑外推/故障注入测试)")
     ap.add_argument("--mock-spec",
                     help="mock 参数: models=m1;m2,ram_gb=16,delay=0.2,jitter=0.1,fail_p=0.1,busy=1")
+    
+    # Prima.cpp engine arguments
+    add_prima_args(ap)
+    
     args = ap.parse_args()
     try:
         asyncio.run(amain(args))
