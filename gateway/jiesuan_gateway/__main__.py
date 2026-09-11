@@ -370,10 +370,10 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     t0 = time.time()
     _trace(st, rid=rid, event="route", model=model, node=node.name,
            sched=st.scheduler.name, candidates=[n.name for n in nodes])
-    # 思考模型默认注入 think:false — qwen3/deepseek-r1 系思考模式会把输出预算
-    # 全耗在 thinking 上, content 永远为空, 客户端 (Hermes) 看到的是"空回复/empty stream"
+    # 思考模型默认开启思考 (qwen3/deepseek-r1 思考后回答质量更高)
+    # 注意: 思考帧在节点侧映射为 reasoning_content, 不影响 content 输出
     if model.startswith(("qwen3", "deepseek-r1")) and "think" not in body:
-        body = {**body, "think": False}
+        body = {**body, "think": True}
     try:
         # ---- pull (ws) 节点: 经出站隧道下发, 无需节点可达 ----
         if node.transport == "ws":

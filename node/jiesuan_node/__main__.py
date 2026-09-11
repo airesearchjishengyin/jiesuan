@@ -257,6 +257,21 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
         
         # Ollama engine (default)
         body = await request.json()
+        # OpenAI 风格字段 → Ollama 原生字段映射:
+        #   max_tokens → options.num_predict (否则 Ollama 忽略)
+        #   思考模型思考链不可控 (think level/budget 均无效), 必须给足预算:
+        #   预算太小会被 thinking 吃光 → finish_reason=length, content 永空
+        model_name = body.get("model", "")
+        thinking_model = model_name.startswith(("qwen3", "deepseek-r1"))
+        opts = dict(body.get("options") or {})
+        if "num_predict" not in opts:
+            mt = body.get("max_tokens")
+            if isinstance(mt, int) and mt > 0 and not thinking_model:
+                opts["num_predict"] = mt
+            else:
+                opts["num_predict"] = 8192   # 思考+回答总预算 (思考模型必须给足)
+        if opts:
+            body = {**body, "options": opts}
         url = yarl.URL(f"{st.engine_url}/api/chat")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
         wants_stream = bool(body.get("stream", True))
@@ -308,11 +323,17 @@ async def proxy_chat(request: web.Request) -> web.StreamResponse:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        content = obj.get("message", {}).get("content", "")
+                        msg = obj.get("message", {})
+                        content = msg.get("content", "")
+                        thinking = msg.get("thinking", "") or ""
                         if obj.get("done"):
                             finish = obj.get("done_reason") or "stop"
                             continue
-                        delta = {"content": content} if content else {}
+                        delta = {}
+                        if thinking:
+                            delta["reasoning_content"] = thinking
+                        if content:
+                            delta["content"] = content
                         sse = {
                             "id": cid, "object": "chat.completion.chunk",
                             "created": created, "model": obj.get("model", ""),
